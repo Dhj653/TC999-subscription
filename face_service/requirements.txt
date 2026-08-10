@@ -1,0 +1,27 @@
+# ===== face_service 依赖 =====
+# Web 框架
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+pydantic==2.8.2
+pydantic-settings==2.4.0
+python-multipart==0.0.9
+
+# 人脸检测 / 向量
+insightface==0.7.3
+onnxruntime==1.18.1          # CPU 推理（如需 GPU 可换 onnxruntime-gpu）
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
+faiss-cpu==1.8.0.post1
+
+# 视频抽帧
+ffmpeg-python==0.2.0
+
+# 压缩包内存解析
+py7zr==0.21.2                # 7z 内存解压
+# zipfile 为 Python 标准库，无需安装
+
+# 配置 / 日志
+python-dotenv==1.0.1
+
+# 萤核数据库复用（sqlite3 为标准库，无需安装）
+# 任务串行：使用 asyncio + 单进程内存队列
