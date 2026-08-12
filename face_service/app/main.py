@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import database as DB
 from .config import resolve_path, settings
-from .routers import characters, groups, operations, scan
+from .routers import characters, dedup, groups, operations, scan
 from .services import task_queue
 from .utils.logger import get_logger
 
@@ -57,6 +57,7 @@ app.include_router(scan.router)
 app.include_router(groups.router)
 app.include_router(operations.router)
 app.include_router(characters.router)
+app.include_router(dedup.router)
 
 
 # ===== 健康检查 =====

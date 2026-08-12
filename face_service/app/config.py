@@ -81,6 +81,14 @@ class _Settings:
     # 路径安全
     blocked_path_roots: list[str]
 
+    # 【新增】视频去重
+    dedup_enabled: bool
+    dedup_keyframes: int
+    dedup_duration_tolerance_sec: float
+    dedup_min_hash_matches: int
+    dedup_repeat_folder_name: str
+    dedup_nesting: bool
+
     # ===== 运行时可调（运行时 set_runtime 覆盖 .env 默认值）=====
     _runtime: dict
 
@@ -131,6 +139,12 @@ def _init_settings() -> _Settings:
         test_preview_mode=_get_bool("TEST_PREVIEW_MODE", True),
         thumbnail_dir=os.getenv("THUMBNAIL_DIR", "./thumbnails"),
         blocked_path_roots=blocked,
+        dedup_enabled=_get_bool("DEDUP_ENABLED", True),
+        dedup_keyframes=_get_int("DEDUP_KEYFRAMES", 5),
+        dedup_duration_tolerance_sec=_get_float("DEDUP_DURATION_TOLERANCE_SEC", 2.0),
+        dedup_min_hash_matches=_get_int("DEDUP_MIN_HASH_MATCHES", 5),  # 默认 5/5 帧完全一致
+        dedup_repeat_folder_name=os.getenv("DEDUP_REPEAT_FOLDER_NAME", "_重复文件_"),
+        dedup_nesting=_get_bool("DEDUP_NESTING", True),
         _runtime={},
     )
 

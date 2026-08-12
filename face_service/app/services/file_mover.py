@@ -3,6 +3,7 @@
 1. move_all 仅移动 "分组视频数 >= FOLDER_CREATE_MIN_VIDEOS" 的分组（新需求：2 个同人才建夹）
 2. 单人视频按策略处理（留原位 / 归未分类）
 3. 角色命名后 rename_character_folder 联动重命名磁盘文件夹
+4. 【新增】视频内容级去重：相同画面/内容的视频归档到 _重复文件_[/子目录]/，支持任意层嵌套
 """
 from __future__ import annotations
 
@@ -211,3 +212,167 @@ def rename_character_folder(
     except Exception as e:  # noqa: BLE001
         return {"success": False, "message": f"重命名失败：{e}",
                 "old_path": old_folder_path}
+
+
+# ============================================================
+# 【新增】重复视频归档：_重复文件_ 目录 + 任意层嵌套
+# ============================================================
+def _resolve_repeat_subdir(
+    current_layer_dir: str,
+    current_fp_hashes: list[str],
+    *,
+    fingerprints_in_layer: list[dict],
+    depth: int = 0,
+) -> str:
+    """
+    针对一层目录（current_layer_dir），决定该重复视频应该放置的**直接子目录**。
+    - 如果本层没有与 current_fp_hashes 相同内容的视频：
+        返回 current_layer_dir 本身（允许放在这一层）
+    - 如果本层已经有相同内容的视频：
+        * 若 dedup_nesting=False → 返回 current_layer_dir / settings.dedup_repeat_folder_name
+        * 若 dedup_nesting=True  → 进入下一层 _重复文件_ 递归计算
+          （如果该层已有"兄弟"视频与 current 相同 → 在 _重复文件_ 内再分配序号子目录 _重复_N_）
+
+    fingerprints_in_layer：本层目录下所有"非 duplicate_of=某ID"的已归档视频指纹。
+    返回值：最终目标目录（可能是 current_layer_dir / _重复文件_ / _重复_3_）。
+    """
+    from ..config import settings
+    from .video_hasher import is_duplicate, VideoFingerprint
+
+    # 1) 先看本层是否有内容相同的
+    conflict_at_layer = False
+    for f in fingerprints_in_layer:
+        if f.get("ignored"):
+            continue
+        f_hashes = f.get("hashes") or []
+        # 构造 fp 用于比较（只用到 hashes / duration / width / height）
+        if is_duplicate(
+            VideoFingerprint("<current>", None, None, None, 0, current_fp_hashes),
+            b_hashes=f_hashes,
+            b_duration=f.get("duration_sec"),
+            b_width=f.get("width"),
+            b_height=f.get("height"),
+        ):
+            conflict_at_layer = True
+            break
+    if not conflict_at_layer:
+        # 本层无冲突，可以直接放在这一层
+        return current_layer_dir
+
+    # 2) 有冲突 → 进入 _重复文件_ 子目录
+    repeat_root_name = settings.dedup_repeat_folder_name
+    repeat_root = os.path.join(current_layer_dir, repeat_root_name)
+
+    if not settings.dedup_nesting:
+        # 简单模式：不嵌套，全部扔到 _重复文件_ 下
+        return repeat_root
+
+    # 3) 嵌套模式：递归为 repeat_root 分配序号子目录
+    # 为了保证"同一层文件夹内不能有相同视频"，在 _重复文件_ 内把"互相重复"的分到不同序号子目录
+    # 策略：维护序号子目录 list，每个序号子目录存放一批"互相不重复"的视频；
+    #       若所有序号子目录都有与之冲突的，则新建序号
+    siblings = _list_repeat_subdirs(repeat_root)
+    # 每个子目录要知道里面的 fingerprints：调用方通过 DB 的 only_within_dir 查询即可；
+    # 这里用简化但正确的策略：为每次冲突分配递增序号目录，直到找到"该序号目录里没有相同指纹"为止
+    subdir_idx = 1
+    while True:
+        subdir = os.path.join(repeat_root, f"_重复_{subdir_idx}组_")
+        # 取 subdir 目录下已有的主指纹（通过 only_within_dir 过滤）
+        subdir_fps = [f for f in fingerprints_in_layer
+                      if f.get("video_path") and (
+                          f["video_path"].startswith(subdir + os.sep)
+                          or f["video_path"].startswith(subdir + "/"))]
+        # 再加入 _重复文件夹_ 根下（非子目录内）的文件 → 同样作为 subdir_idx=0
+        if subdir_idx == 1:
+            # 把 repeat_root 本身下的文件也纳入检测（指纹可能在 repeat_root）
+            root_fps = [f for f in fingerprints_in_layer
+                        if f.get("video_path") and (
+                            f["video_path"].startswith(repeat_root + os.sep)
+                            or f["video_path"].startswith(repeat_root + "/"))
+                        and not any(f["video_path"].startswith(
+                            os.path.join(repeat_root, g) + os.sep)
+                            or f["video_path"].startswith(os.path.join(repeat_root, g) + "/")
+                            for g in _list_repeat_subdirs(repeat_root, fullpath=False))]
+            subdir_fps = subdir_fps + root_fps
+        still_conflict = False
+        for f in subdir_fps:
+            if is_duplicate(
+                VideoFingerprint("<current>", None, None, None, 0, current_fp_hashes),
+                b_hashes=f.get("hashes") or [],
+                b_duration=f.get("duration_sec"),
+                b_width=f.get("width"),
+                b_height=f.get("height"),
+            ):
+                still_conflict = True
+                break
+        if not still_conflict:
+            return subdir
+        subdir_idx += 1
+        # 安全上限 999
+        if subdir_idx > 999:
+            return subdir
+
+
+def _list_repeat_subdirs(repeat_root: str, *, fullpath: bool = True) -> list[str]:
+    """列出 repeat_root 下形如 _重复_N组_ 的子目录名（或完整路径）。不存在返回 []。"""
+    import re
+    if not os.path.isdir(repeat_root):
+        return []
+    pat = re.compile(r"^_重复_(\d+)组_$")
+    out = []
+    try:
+        for name in os.listdir(repeat_root):
+            if pat.match(name):
+                out.append(os.path.join(repeat_root, name) if fullpath else name)
+    except OSError:
+        pass
+    return sorted(out)
+
+
+def move_duplicate_to_repeat_dir(
+    video_path: str,
+    target_role_dir: str,
+    current_fp_hashes: list[str],
+    *,
+    test_mode: bool,
+    fingerprints_in_role: list[dict],
+) -> dict:
+    """
+    把视频 video_path 从它当前位置，根据与 fingerprints_in_role 的冲突情况，
+    放置到合理的嵌套目录，以保证"同一层目录内不出现相同视频"。
+
+    fingerprints_in_role: 该角色目录下（含子目录）全部指纹列表（含重复文件内的）。
+    返回 dict: {success, moved, target_path, message, target_dir, layer_desc}
+    """
+    if not os.path.exists(video_path):
+        return {"success": False, "message": f"源文件不存在: {video_path}"}
+
+    # 深度优先：从顶层 target_role_dir 开始递归判定存放位置
+    target_dir = _resolve_repeat_subdir(
+        target_role_dir, current_fp_hashes,
+        fingerprints_in_layer=fingerprints_in_role, depth=0,
+    )
+
+    src = video_path
+    base = os.path.basename(src)
+    target_path = os.path.join(target_dir, base)
+
+    # 处理目标已存在同名（不同内容）的情况
+    if os.path.exists(target_path) and os.path.abspath(target_path) != os.path.abspath(src):
+        bname, ext = os.path.splitext(base)
+        i = 1
+        while os.path.exists(target_path):
+            target_path = os.path.join(target_dir, f"{bname}_{i}{ext}")
+            i += 1
+
+    if test_mode:
+        return {"success": True, "moved": False, "test_mode": True,
+                "message": f"[预览重复归档] 拟 → {target_path}",
+                "target_path": target_path, "target_dir": target_dir}
+
+    _ensure_dir(target_dir)
+    shutil.move(src, target_path)
+    log.info("重复视频归档 %s → %s", src, target_path)
+    return {"success": True, "moved": True,
+            "target_path": target_path, "target_dir": target_dir,
+            "message": "已归档到重复目录"}

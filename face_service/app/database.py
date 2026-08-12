@@ -137,6 +137,31 @@ _TABLES_DDL: dict[str, str] = {
             value TEXT NOT NULL
         )
     """,
+    # 【新增】视频指纹表（用于内容级画面去重）
+    "face_video_fingerprint": """
+        CREATE TABLE IF NOT EXISTS face_video_fingerprint (
+            fingerprint_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id           INTEGER,
+            mapping_id        INTEGER,              -- 可选：与视频映射关联
+            video_path        TEXT    NOT NULL,     -- 当前视频路径（移动后也更新）
+            original_video_path TEXT NOT NULL,      -- 原始路径
+            duration_sec      REAL,                 -- 时长（秒）
+            width             INTEGER,
+            height            INTEGER,
+            file_size         INTEGER NOT NULL DEFAULT 0,  -- 文件大小（快速筛）
+            -- 关键帧感知哈希：JSON 数组，每个元素为 16 位十六进制字符串（64bit dHash）
+            hashes_json       TEXT    NOT NULL DEFAULT '[]',
+            -- 与哪个 fingerprint_id 重复（NULL=主视频/未发现重复；非NULL=重复副本）
+            duplicate_of      INTEGER,
+            -- 是否被用户忽略（即便判定重复也保留原位）
+            ignored           INTEGER NOT NULL DEFAULT 0,
+            created_at        REAL    NOT NULL,
+            updated_at        REAL    NOT NULL,
+            FOREIGN KEY (task_id)    REFERENCES face_scan_task(id)   ON DELETE SET NULL,
+            FOREIGN KEY (mapping_id) REFERENCES face_video_mapping(id) ON DELETE SET NULL,
+            FOREIGN KEY (duplicate_of) REFERENCES face_video_fingerprint(fingerprint_id) ON DELETE SET NULL
+        )
+    """,
 }
 
 
@@ -487,3 +512,132 @@ def all_settings() -> dict[str, str]:
     c = _cur()
     c.execute("SELECT key, value FROM face_service_setting")
     return {r[0]: r[1] for r in c.fetchall()}
+
+
+# ==============================================================
+# 【新增】face_video_fingerprint 视频指纹/去重
+# ==============================================================
+def create_fingerprint(
+    *,
+    video_path: str,
+    original_video_path: str,
+    hashes: List[str],
+    duration_sec: Optional[float] = None,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    file_size: int = 0,
+    task_id: Optional[int] = None,
+    mapping_id: Optional[int] = None,
+    duplicate_of: Optional[int] = None,
+) -> int:
+    c = _cur()
+    now = _now()
+    c.execute(
+        """
+        INSERT INTO face_video_fingerprint
+        (task_id, mapping_id, video_path, original_video_path,
+         duration_sec, width, height, file_size, hashes_json,
+         duplicate_of, ignored, created_at, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?, 0, ?, ?)
+        """,
+        (
+            task_id, mapping_id, video_path, original_video_path,
+            duration_sec, width, height, file_size,
+            json.dumps(hashes, ensure_ascii=False),
+            duplicate_of, now, now,
+        ),
+    )
+    _commit()
+    return int(c.lastrowid)
+
+
+def get_fingerprint(fingerprint_id: int) -> Optional[dict]:
+    c = _cur()
+    c.execute("SELECT * FROM face_video_fingerprint WHERE fingerprint_id=?",
+              (fingerprint_id,))
+    row = _row_to_dict(c.fetchone())
+    if row and row.get("hashes_json"):
+        try:
+            row["hashes"] = json.loads(row["hashes_json"])
+        except Exception:  # noqa: BLE001
+            row["hashes"] = []
+    return row
+
+
+def list_fingerprints(
+    *,
+    task_id: Optional[int] = None,
+    only_duplicates: bool = False,
+    only_within_dir: Optional[str] = None,
+) -> list[dict]:
+    """列出指纹。如果指定 only_within_dir，只返回 video_path 位于该目录下的。"""
+    c = _cur()
+    sql = "SELECT * FROM face_video_fingerprint WHERE 1=1"
+    args: list[Any] = []
+    if task_id is not None:
+        sql += " AND task_id=?"
+        args.append(task_id)
+    if only_duplicates:
+        sql += " AND duplicate_of IS NOT NULL AND ignored=0"
+    if only_within_dir:
+        # LIKE 前缀匹配（路径安全：目录绝对路径以 / 或 \ 结尾才准确，但 LIKE 足够用于过滤）
+        sql += " AND (video_path LIKE ? OR video_path LIKE ?)"
+        args.append(only_within_dir.rstrip("/\\") + os.sep + "%")
+        args.append(only_within_dir.rstrip("/\\") + "/" + "%")
+    sql += " ORDER BY fingerprint_id"
+    c.execute(sql, args)
+    rows = _rows_to_dicts(c.fetchall())
+    for r in rows:
+        try:
+            r["hashes"] = json.loads(r["hashes_json"]) if r.get("hashes_json") else []
+        except Exception:  # noqa: BLE001
+            r["hashes"] = []
+    return rows
+
+
+def update_fingerprint(fingerprint_id: int, **fields) -> None:
+    if not fields:
+        return
+    fields["updated_at"] = _now()
+    if "hashes" in fields:
+        fields["hashes_json"] = json.dumps(fields.pop("hashes"), ensure_ascii=False)
+    cols = ", ".join(f"{k}=?" for k in fields)
+    vals = list(fields.values()) + [fingerprint_id]
+    _cur().execute(f"UPDATE face_video_fingerprint SET {cols} WHERE fingerprint_id=?", vals)
+    _commit()
+
+
+def find_duplicate_candidates(
+    duration_sec: Optional[float],
+    width: Optional[int],
+    height: Optional[int],
+    file_size: int,
+    *,
+    duration_tolerance: float = 2.0,
+) -> list[dict]:
+    """根据快速过滤条件（时长/分辨率/文件大小近似）筛选可能重复的主视频候选。"""
+    c = _cur()
+    sql = ("SELECT * FROM face_video_fingerprint "
+           "WHERE duplicate_of IS NULL AND ignored=0")
+    args: list[Any] = []
+    if file_size and file_size > 0:
+        # 文件大小差异不超过 3% 才候选（快速过滤）
+        lo = int(file_size * 0.97)
+        hi = int(file_size * 1.03)
+        sql += " AND file_size BETWEEN ? AND ?"
+        args.extend([lo, hi])
+    if width and height:
+        sql += " AND width=? AND height=?"
+        args.extend([width, height])
+    if duration_sec is not None:
+        sql += " AND duration_sec BETWEEN ? AND ?"
+        args.extend([duration_sec - duration_tolerance, duration_sec + duration_tolerance])
+    sql += " ORDER BY fingerprint_id"
+    c.execute(sql, args)
+    rows = _rows_to_dicts(c.fetchall())
+    for r in rows:
+        try:
+            r["hashes"] = json.loads(r["hashes_json"]) if r.get("hashes_json") else []
+        except Exception:  # noqa: BLE001
+            r["hashes"] = []
+    return rows

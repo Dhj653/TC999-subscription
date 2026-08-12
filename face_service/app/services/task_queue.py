@@ -31,9 +31,12 @@ from ..utils.logger import get_logger
 from .archive import is_archive, list_entries, read_entry_bytes
 from .clustering import VideoFaceBag, incremental_cluster, match_to_character_library
 from .face_engine import FaceEngine, FaceFeature
-from .file_mover import move_all, rename_character_folder
+from .file_mover import move_all, rename_character_folder, move_duplicate_to_repeat_dir
 from .name_parser import extract_names
 from .path_safety import group_output_dir, is_safe_output_path, sanitize_group_name, validate_scan_folder
+from .video_hasher import (
+    VideoFingerprint, compute_fingerprint, dhash, find_matching_master,
+)
 from .video_processor import extract_frames
 
 log = get_logger()
@@ -167,9 +170,13 @@ async def _do_scan(task_id: int) -> None:
         DB.append_task_log(task_id, f"加载角色库：{len(char_lib)} 个已命名角色")
 
     # 3. 逐视频处理：抽帧 → 检测 → 取代表特征 + 最清晰帧
+    #     【新增】同时保存少量关键帧（均匀取 5 张）用于 dHash 去重，避免二次抽帧
     bags: List[VideoFaceBag] = []
     best_frames: Dict[int, tuple] = {}  # video_idx → (frame, face bbox, embedding)
     matched_characters: Dict[int, int] = {}  # video_idx → character_id（角色库命中的）
+    dedup_framebuf: Dict[int, List[np.ndarray]] = {}  # video_idx → 最近 K 张视频帧（均匀保留 N 张用于 dHash）
+    dedup_keysamples_for_idx: Dict[int, list] = {}     # video_idx → dHash 十六进制字符串数组（最终）
+    dedup_metainfo: Dict[int, tuple] = {}              # video_idx → (duration, width, height, file_size, real_path)
 
     processed = 0
     for idx, item in enumerate(all_items):
@@ -182,6 +189,19 @@ async def _do_scan(task_id: int) -> None:
         DB.update_task(task_id, current_video=item["display"], processed_videos=idx)
         bag = VideoFaceBag(idx, item["display"])
         best_score_frame = (-1.0, None, None, None)  # (blur*det, frame, bbox, emb)
+
+        # 【去重】准备：为该视频收集均匀分布的 K 帧
+        N_KEY = max(1, int(settings.dedup_keyframes))
+        frame_buf: List[np.ndarray] = []  # 候选帧（临时保存所有，结束后均匀采样）
+
+        # 文件 size / probe 信息（若为磁盘文件可快速获得）
+        file_size = 0
+        real_video_path: Optional[str] = item.get("path") if item.get("type") == "file" else None
+        if real_video_path and os.path.exists(real_video_path):
+            try:
+                file_size = os.path.getsize(real_video_path)
+            except OSError:
+                file_size = 0
 
         try:
             if item["type"] == "file":
@@ -205,11 +225,43 @@ async def _do_scan(task_id: int) -> None:
                     score = f.blur_score * f.det_score
                     if score > best_score_frame[0]:
                         best_score_frame = (score, frame.copy(), f.bbox, f.embedding.copy())
+                # 【去重】保留该帧副本
+                frame_buf.append(frame.copy())
                 del frame
         except Exception as e:  # noqa: BLE001
             DB.append_task_log(task_id, f"  ⚠ 抽帧失败，跳过 {item['display']}: {e}")
             processed += 1
             continue
+
+        # 【去重】从 frame_buf 均匀采样 N_KEY 帧 → 计算 dHash
+        if settings.dedup_enabled:
+            hashes: List[str] = []
+            if frame_buf:
+                # 从 [10%..90%] 区间取 N_KEY 张（避免片头片尾黑帧）
+                nbuf = len(frame_buf)
+                sample_idx: List[int] = []
+                if nbuf <= N_KEY:
+                    sample_idx = list(range(nbuf))
+                else:
+                    lo = int(nbuf * 0.1)
+                    hi = int(nbuf * 0.9)
+                    if hi <= lo:
+                        hi = nbuf - 1
+                        lo = 0
+                    for k in range(N_KEY):
+                        ratio = 0 if N_KEY == 1 else k / (N_KEY - 1)
+                        pos = int(lo + (hi - lo) * ratio)
+                        sample_idx.append(max(0, min(nbuf - 1, pos)))
+                for si in sample_idx:
+                    hashes.append(dhash(frame_buf[si]))
+            # 不足补 0
+            while len(hashes) < N_KEY:
+                hashes.append(hashes[-1] if hashes else "0" * 16)
+            dedup_keysamples_for_idx[idx] = hashes[:N_KEY]
+            dedup_metainfo[idx] = (None, None, None, file_size, real_video_path)
+        # 释放 frame_buf 内存
+        frame_buf.clear()
+        del frame_buf
 
         if bag.face_count == 0:
             DB.append_task_log(task_id, f"  - {os.path.basename(item['display'][:50])}: 无符合条件的女性人脸，跳过")
@@ -432,6 +484,174 @@ async def _do_scan(task_id: int) -> None:
     if test_mode:
         DB.append_task_log(task_id, "测试预览模式：只生成预览，不移动磁盘文件")
     move_all(task_id, test_mode)
+
+    # 7.5 【新增】视频内容级去重：为所有 mapping 计算指纹 → 检测重复 → 归档到 _重复文件_[/子目录]/
+    if settings.dedup_enabled:
+        DB.append_task_log(task_id, "开始视频内容去重处理 ...")
+        dedup_archived = 0
+        dedup_previewed = 0
+        # mapping_id → 所属角色的顶层目录（group→character→folder_path，或按 group_name 生成 output_root/<group_name>）
+        all_mappings = DB.list_mappings(task_id=task_id)
+        all_groups = {g["group_id"]: g for g in DB.list_groups(task_id)}
+        # 先收集 mapping_id → video_idx（反向映射）
+        # 由于 dedup_keysamples_for_idx 用的是 all_items 的下标 idx，而 mapping 上没有存 idx，
+        # 这里通过 original_video_path + source 匹配（精确，任务内唯一）
+        idx_item_path_info: Dict[str, int] = {}  # key = type|archive|inarchive|path → idx
+        for i, it in enumerate(all_items):
+            if it.get("type") == "archive":
+                k = f"archive|{it.get('archive','')}|{it.get('in_archive','')}|{it.get('path','')}"
+            else:
+                k = f"file|||{it.get('path','')}"
+            idx_item_path_info[k] = i
+
+        def _video_idx_from_mapping(m) -> Optional[int]:
+            if m["source"] == "archive":
+                k = f"archive|{m.get('archive_path','')}|{m.get('in_archive_name','')}|{m.get('original_video_path','')}"
+            else:
+                k = f"file|||{m.get('original_video_path','')}"
+            return idx_item_path_info.get(k)
+
+        # 阶段 7.5.1：遍历所有 mapping，写入/补全 face_video_fingerprint，并标记 duplicate_of
+        mid_to_fpid: Dict[int, int] = {}
+        for m in all_mappings:
+            vid_idx = _video_idx_from_mapping(m)
+            hashes: List[str] = []
+            duration = None
+            width = None
+            height = None
+            file_size = 0
+            if vid_idx is not None and vid_idx in dedup_keysamples_for_idx:
+                hashes = list(dedup_keysamples_for_idx[vid_idx])
+                meta = dedup_metainfo.get(vid_idx)
+                if meta:
+                    duration, width, height, file_size, _ = meta
+            if not hashes and settings.dedup_enabled:
+                # 兜底：二次算指纹（对原路径落盘视频）
+                try:
+                    if m["source"] == "file" and os.path.exists(m["video_path"]):
+                        fp = compute_fingerprint(video_path=m["video_path"])
+                    elif m["source"] == "archive" and m["archive_path"] and m["in_archive_name"]:
+                        vbytes = read_entry_bytes(m["archive_path"], m["in_archive_name"])
+                        if vbytes:
+                            fp = compute_fingerprint(video_bytes=vbytes)
+                        else:
+                            fp = None
+                    else:
+                        fp = None
+                    if fp:
+                        hashes = list(fp.hashes)
+                        duration = fp.duration_sec
+                        width = fp.width
+                        height = fp.height
+                        file_size = fp.file_size
+                except Exception as e:  # noqa: BLE001
+                    log.warning("兜底指纹计算失败(忽略): %s", e)
+            if not hashes:
+                # 无指纹 → 跳过
+                continue
+
+            # 快速筛候选（只看"主视频"，duplicate_of 空）
+            cands = DB.find_duplicate_candidates(
+                duration, width, height, file_size,
+                duration_tolerance=settings.dedup_duration_tolerance_sec,
+            )
+            # 比较 dHash
+            cur_fp_obj = VideoFingerprint(
+                m["video_path"], duration, width, height, file_size, hashes,
+            )
+            master_id = find_matching_master(cur_fp_obj, cands)
+            fpid = DB.create_fingerprint(
+                video_path=m["video_path"],
+                original_video_path=m["original_video_path"],
+                hashes=hashes,
+                duration_sec=duration, width=width, height=height, file_size=file_size,
+                task_id=task_id, mapping_id=m["id"],
+                duplicate_of=master_id,
+            )
+            mid_to_fpid[m["id"]] = fpid
+
+        # 阶段 7.5.2：对 duplicate_of 非空的视频，按"所属角色目录"执行归档移动
+        # 先建立 mapping_id → 所属目标角色顶层目录
+        def _role_target_dir(m) -> Optional[str]:
+            g = all_groups.get(m["group_id"])
+            if not g:
+                return None
+            # 优先用关联 character.folder_path；否则按 output_root+group_name 生成（与 move_all 一致）
+            cid = None
+            if g["status"] == "linked_character":
+                # 查 character.name == g.group_name 的 active 角色
+                for ch in DB.list_characters(include_deleted=True):
+                    if ch["name"] == g["group_name"]:
+                        cid = ch["character_id"]
+                        break
+            if cid is None:
+                # 查创建记录里的 created_character_ids（上一步的字典在本函数局部变量里不可见，退而求其次：按 group_name 和 folder_path 输出目录生成）
+                for ch in DB.list_characters(include_deleted=True):
+                    if ch["original_name"] == g["group_name"] or ch["name"] == g["group_name"]:
+                        cid = ch["character_id"]
+                        break
+            if cid is not None:
+                ch = DB.get_character(cid)
+                if ch and ch.get("folder_path"):
+                    return ch["folder_path"]
+            # 兜底：和 move_all 的输出目录一致
+            return group_output_dir(output_root, g["group_name"])
+
+        for m in all_mappings:
+            fpid = mid_to_fpid.get(m["id"])
+            if not fpid:
+                continue
+            fp_rec = DB.get_fingerprint(fpid)
+            if not fp_rec or not fp_rec.get("duplicate_of"):
+                continue  # 主视频 / 未发现重复
+            if fp_rec.get("ignored"):
+                continue
+            if m["source"] == "archive":
+                DB.append_task_log(task_id,
+                                   f"  ⊘ 重复压缩包内视频不落盘（mapping#{m['id']} 与 master#{fp_rec['duplicate_of']}），不移动")
+                continue
+
+            role_dir = _role_target_dir(m)
+            if not role_dir:
+                DB.append_task_log(task_id, f"  ⊘ mapping#{m['id']}: 无法定位角色目录，跳过去重归档")
+                continue
+
+            # 该角色目录下全部指纹（用于决定嵌套目录）→ 从 DB 取 only_within_dir
+            fps_in_role = DB.list_fingerprints(only_within_dir=role_dir)
+            current_video_path = m["video_path"] if os.path.exists(m["video_path"]) else m["original_video_path"]
+            if not os.path.exists(current_video_path):
+                continue
+
+            result = move_duplicate_to_repeat_dir(
+                current_video_path,
+                role_dir,
+                fp_rec.get("hashes") or [],
+                test_mode=test_mode,
+                fingerprints_in_role=fps_in_role,
+            )
+            if result.get("success"):
+                if result.get("moved"):
+                    dedup_archived += 1
+                    # 更新 mapping.video_path 和 fingerprint.video_path
+                    DB.update_mapping(m["id"], video_path=result["target_path"])
+                    DB.update_fingerprint(fpid, video_path=result["target_path"])
+                elif result.get("test_mode"):
+                    dedup_previewed += 1
+                msg = f"  ⇲ 重复视频：{os.path.basename(current_video_path)[:50]} 已" + (
+                    "归档" if result.get("moved") else (
+                        f"[预览]拟归档 → {result.get('target_dir','')}" if result.get("test_mode") else ""
+                    )
+                )
+                DB.append_task_log(task_id, msg)
+
+        msg_dd = f"内容去重完毕：检测到 {dedup_archived + dedup_previewed} 个重复视频"
+        if test_mode:
+            msg_dd += f"（预览模式：{dedup_previewed} 个拟归档）"
+        else:
+            msg_dd += f"（已归档 {dedup_archived} 个到 {settings.dedup_repeat_folder_name} 嵌套目录）"
+        DB.append_task_log(task_id, msg_dd)
+    else:
+        DB.append_task_log(task_id, "内容去重关闭（DEDUP_ENABLED=false），跳过")
 
     # 8. 完成
     DB.update_task(task_id, status="completed", processed_videos=processed, current_video=None)
