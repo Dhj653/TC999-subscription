@@ -1,0 +1,30 @@
+# ============================================
+# 萤核 - 人脸视频分类外挂服务 依赖清单
+# 运行： pip install -r requirements.txt
+# ============================================
+
+# ===== Web 框架 =====
+fastapi>=0.104            # Web 框架
+uvicorn[standard]>=0.24   # ASGI 服务器
+pydantic>=2.5             # 数据校验
+
+# ===== 工具库 =====
+python-dotenv>=1.0        # .env 配置加载
+python-multipart>=0.0.6   # （可选，如需上传文件）
+
+# ===== 人脸 & 视觉 =====
+insightface>=0.7.3        # 人脸检测 + 性别 + 特征提取（buffalo_l 模型）
+onnxruntime>=1.16         # InsightFace 依赖（CPU 版，GPU 换 onnxruntime-gpu）
+opencv-python>=4.8        # 图像读取 + 拉普拉斯模糊度计算
+numpy>=1.24               # 数值计算
+
+# ===== 聚类 =====
+faiss-cpu>=1.7.4          # FAISS 向量聚类（GPU 版换 faiss-gpu）
+
+# ===== 视频抽帧 =====
+# ffmpeg 需要单独安装到系统（或随包放 ffmpeg.exe / ffmpeg）
+# 设置 FFMPEG_BIN / FFPROBE_BIN 环境变量指向可执行文件
+
+# ===== 压缩包内存解析 =====
+py7zr                     # 7z 内存解压
+# zipfile 为 Python 标准库，无需安装
