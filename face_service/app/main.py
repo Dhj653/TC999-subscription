@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
 from .database import init_db
-from .routers import groups, operations, scan
+from .routers import characters, dedup, groups, operations, scan
 from .services import task_queue
 from .utils.logger import get_logger
 
@@ -50,6 +50,8 @@ app.add_middleware(
 app.include_router(scan.router)
 app.include_router(groups.router)
 app.include_router(operations.router)
+app.include_router(characters.router)
+app.include_router(dedup.router)
 
 
 @app.get("/", tags=["health"])
